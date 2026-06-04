@@ -1,0 +1,735 @@
+from flask import Flask, request, redirect, session, send_from_directory, render_template_string, url_for
+import sqlite3
+import os
+from datetime import datetime
+from werkzeug.utils import secure_filename
+from functools import wraps
+
+app = Flask(__name__)
+app.secret_key = "change-this-secret-key"
+
+DB_NAME = "psynova.db"
+UPLOAD_FOLDER = "uploads"
+ADMIN_PHONE = "01700000000"   # Change this to your admin phone number
+MAX_NORMAL_USERS = 10
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+
+# ---------------- DATABASE ----------------
+
+def db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        university TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        filename TEXT NOT NULL,
+        stored_name TEXT NOT NULL,
+        uploaded_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT NOT NULL DEFAULT 'Pending',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS work_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        task_id INTEGER,
+        start_time TEXT NOT NULL,
+        end_time TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(task_id) REFERENCES tasks(id)
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+# ---------------- HELPERS ----------------
+
+def now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def parse_time(value):
+    return datetime.fromisoformat(value)
+
+
+def current_user():
+    if "user_id" not in session:
+        return None
+    conn = db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+    conn.close()
+    return user
+
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            return redirect("/login")
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or user["role"] != "admin":
+            return redirect("/")
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def format_seconds(seconds):
+    hours = seconds / 3600
+    days = hours / 24
+    return f"{hours:.2f} hours / {days:.2f} days"
+
+
+def total_work_seconds(user_id):
+    conn = db()
+    sessions = conn.execute(
+        "SELECT start_time, end_time FROM work_sessions WHERE user_id=?",
+        (user_id,)
+    ).fetchall()
+    conn.close()
+
+    total = 0
+    for s in sessions:
+        start = parse_time(s["start_time"])
+        end = parse_time(s["end_time"]) if s["end_time"] else datetime.now()
+        total += int((end - start).total_seconds())
+
+    return total
+
+
+def has_active_session(user_id):
+    conn = db()
+    active = conn.execute(
+        "SELECT * FROM work_sessions WHERE user_id=? AND end_time IS NULL",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+    return active
+
+
+# ---------------- HTML BASE ----------------
+
+def page(title, body):
+    user = current_user()
+
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{{ title }}</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background: #f4f7fb;
+                margin: 0;
+                color: #222;
+            }
+
+            header {
+                background: #243b55;
+                color: white;
+                padding: 18px;
+                text-align: center;
+            }
+
+            nav {
+                background: #141e30;
+                padding: 12px;
+                text-align: center;
+            }
+
+            nav a {
+                color: white;
+                margin: 0 12px;
+                text-decoration: none;
+                font-weight: bold;
+            }
+
+            .container {
+                max-width: 1000px;
+                margin: 25px auto;
+                background: white;
+                padding: 25px;
+                border-radius: 10px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+            }
+
+            input, textarea, select, button {
+                width: 100%;
+                padding: 10px;
+                margin: 8px 0;
+                box-sizing: border-box;
+            }
+
+            button {
+                background: #243b55;
+                color: white;
+                border: none;
+                cursor: pointer;
+                border-radius: 5px;
+            }
+
+            button:hover {
+                background: #141e30;
+            }
+
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 15px;
+            }
+
+            th, td {
+                border: 1px solid #ddd;
+                padding: 10px;
+                text-align: left;
+            }
+
+            th {
+                background: #eee;
+            }
+
+            .card {
+                background: #f9fbff;
+                padding: 15px;
+                border-left: 4px solid #243b55;
+                margin-bottom: 15px;
+            }
+
+            .danger {
+                background: #b00020;
+            }
+
+            .success {
+                background: #197b30;
+            }
+
+            .small {
+                color: #666;
+                font-size: 13px;
+            }
+        </style>
+    </head>
+
+    <body>
+        <header>
+            <h1>PsyNova–NeuroMind Mental Health Support Team</h1>
+            <p>Online Working Station</p>
+        </header>
+
+        {% if user %}
+        <nav>
+            <a href="/">Dashboard</a>
+            <a href="/chat">Chat</a>
+            <a href="/files">Files</a>
+            {% if user.role == "admin" %}
+            <a href="/admin">Admin Panel</a>
+            {% endif %}
+            <a href="/logout">Logout</a>
+        </nav>
+        {% endif %}
+
+        <div class="container">
+            {{ body|safe }}
+        </div>
+    </body>
+    </html>
+    """, title=title, body=body, user=user)
+
+
+# ---------------- LOGIN ----------------
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        phone = request.form["phone"].strip()
+        name = request.form["name"].strip()
+        university = request.form["university"].strip()
+
+        conn = db()
+        user = conn.execute("SELECT * FROM users WHERE phone=?", (phone,)).fetchone()
+
+        if user:
+            session["user_id"] = user["id"]
+            conn.close()
+            return redirect("/")
+        else:
+            normal_count = conn.execute(
+                "SELECT COUNT(*) AS total FROM users WHERE role='user'"
+            ).fetchone()["total"]
+
+            role = "admin" if phone == ADMIN_PHONE else "user"
+
+            if role == "user" and normal_count >= MAX_NORMAL_USERS:
+                conn.close()
+                return page("User Limit", "<h2>User limit reached</h2><p>Only 10 normal users are allowed.</p>")
+
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO users (phone, name, university, role, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (phone, name, university, role, now()))
+
+            conn.commit()
+            session["user_id"] = cur.lastrowid
+            conn.close()
+
+            return redirect("/")
+
+    body = """
+    <h2>Login / Register</h2>
+    <form method="POST">
+        <label>Phone Number</label>
+        <input type="text" name="phone" required>
+
+        <label>Name</label>
+        <input type="text" name="name" required>
+
+        <label>University Name</label>
+        <input type="text" name="university" required>
+
+        <button type="submit">Enter Platform</button>
+    </form>
+
+    <p class="small">Admin phone number is set inside app.py.</p>
+    """
+
+    return page("Login", body)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
+
+
+# ---------------- DASHBOARD ----------------
+
+@app.route("/")
+@login_required
+def dashboard():
+    user = current_user()
+    conn = db()
+
+    tasks = conn.execute(
+        "SELECT * FROM tasks WHERE user_id=? ORDER BY id DESC",
+        (user["id"],)
+    ).fetchall()
+
+    active = has_active_session(user["id"])
+    total_seconds = total_work_seconds(user["id"])
+
+    conn.close()
+
+    task_options = ""
+    for task in tasks:
+        task_options += f"<option value='{task['id']}'>{task['title']}</option>"
+
+    active_html = """
+    <form method="POST" action="/work/stop">
+        <button class="danger" type="submit">Stop Work Timer</button>
+    </form>
+    """ if active else f"""
+    <form method="POST" action="/work/start">
+        <label>Select Task</label>
+        <select name="task_id">
+            <option value="">General Work</option>
+            {task_options}
+        </select>
+        <button class="success" type="submit">Start Work Timer</button>
+    </form>
+    """
+
+    task_rows = ""
+    for task in tasks:
+        task_rows += f"""
+        <tr>
+            <td>{task['title']}</td>
+            <td>{task['description'] or ''}</td>
+            <td>{task['status']}</td>
+            <td>
+                <form method="POST" action="/task/status/{task['id']}">
+                    <select name="status">
+                        <option>Pending</option>
+                        <option>In Progress</option>
+                        <option>Completed</option>
+                    </select>
+                    <button type="submit">Update</button>
+                </form>
+            </td>
+        </tr>
+        """
+
+    body = f"""
+    <h2>Welcome, {user['name']}</h2>
+    <p><b>University:</b> {user['university']}</p>
+    <p><b>Role:</b> {user['role']}</p>
+
+    <div class="card">
+        <h3>Your Work Time</h3>
+        <p><b>{format_seconds(total_seconds)}</b></p>
+        {'<p style="color:green;"><b>Timer is running now...</b></p>' if active else '<p class="small">Timer is not running.</p>'}
+        {active_html}
+    </div>
+
+    <h3>Add New Task</h3>
+    <form method="POST" action="/task/add">
+        <input type="text" name="title" placeholder="Task title" required>
+        <textarea name="description" placeholder="Task description"></textarea>
+        <button type="submit">Add Task</button>
+    </form>
+
+    <h3>Your Tasks</h3>
+    <table>
+        <tr>
+            <th>Task</th>
+            <th>Description</th>
+            <th>Status</th>
+            <th>Action</th>
+        </tr>
+        {task_rows}
+    </table>
+    """
+
+    return page("Dashboard", body)
+
+
+# ---------------- WORK TIMER ----------------
+
+@app.route("/work/start", methods=["POST"])
+@login_required
+def start_work():
+    user = current_user()
+
+    if has_active_session(user["id"]):
+        return redirect("/")
+
+    task_id = request.form.get("task_id") or None
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO work_sessions (user_id, task_id, start_time)
+        VALUES (?, ?, ?)
+    """, (user["id"], task_id, now()))
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+
+@app.route("/work/stop", methods=["POST"])
+@login_required
+def stop_work():
+    user = current_user()
+    conn = db()
+
+    active = conn.execute("""
+        SELECT * FROM work_sessions
+        WHERE user_id=? AND end_time IS NULL
+        ORDER BY id DESC LIMIT 1
+    """, (user["id"],)).fetchone()
+
+    if active:
+        conn.execute(
+            "UPDATE work_sessions SET end_time=? WHERE id=?",
+            (now(), active["id"])
+        )
+        conn.commit()
+
+    conn.close()
+    return redirect("/")
+
+
+# ---------------- TASKS ----------------
+
+@app.route("/task/add", methods=["POST"])
+@login_required
+def add_task():
+    user = current_user()
+    title = request.form["title"]
+    description = request.form.get("description", "")
+
+    conn = db()
+    conn.execute("""
+        INSERT INTO tasks (user_id, title, description, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (user["id"], title, description, now()))
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+
+@app.route("/task/status/<int:task_id>", methods=["POST"])
+@login_required
+def update_task_status(task_id):
+    user = current_user()
+    status = request.form["status"]
+
+    conn = db()
+
+    if user["role"] == "admin":
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+    else:
+        conn.execute(
+            "UPDATE tasks SET status=? WHERE id=? AND user_id=?",
+            (status, task_id, user["id"])
+        )
+
+    conn.commit()
+    conn.close()
+
+    return redirect("/")
+
+
+# ---------------- CHAT ----------------
+
+@app.route("/chat", methods=["GET", "POST"])
+@login_required
+def chat():
+    user = current_user()
+    conn = db()
+
+    if request.method == "POST":
+        message = request.form["message"].strip()
+        if message:
+            conn.execute("""
+                INSERT INTO messages (user_id, message, created_at)
+                VALUES (?, ?, ?)
+            """, (user["id"], message, now()))
+            conn.commit()
+
+    messages = conn.execute("""
+        SELECT messages.*, users.name
+        FROM messages
+        JOIN users ON messages.user_id = users.id
+        ORDER BY messages.id DESC
+        LIMIT 50
+    """).fetchall()
+
+    conn.close()
+
+    msg_html = ""
+    for m in messages:
+        msg_html += f"""
+        <div class="card">
+            <b>{m['name']}</b>
+            <p>{m['message']}</p>
+            <p class="small">{m['created_at']}</p>
+        </div>
+        """
+
+    body = f"""
+    <h2>Team Chat</h2>
+
+    <form method="POST">
+        <textarea name="message" placeholder="Write your message..." required></textarea>
+        <button type="submit">Send Message</button>
+    </form>
+
+    <hr>
+    {msg_html}
+    """
+
+    return page("Chat", body)
+
+
+# ---------------- FILE SHARING ----------------
+
+@app.route("/files", methods=["GET", "POST"])
+@login_required
+def files():
+    user = current_user()
+    conn = db()
+
+    if request.method == "POST":
+        uploaded = request.files["file"]
+
+        if uploaded.filename:
+            original_name = secure_filename(uploaded.filename)
+            stored_name = f"{datetime.now().timestamp()}_{original_name}"
+            uploaded.save(os.path.join(UPLOAD_FOLDER, stored_name))
+
+            conn.execute("""
+                INSERT INTO files (user_id, filename, stored_name, uploaded_at)
+                VALUES (?, ?, ?, ?)
+            """, (user["id"], original_name, stored_name, now()))
+            conn.commit()
+
+    file_list = conn.execute("""
+        SELECT files.*, users.name
+        FROM files
+        JOIN users ON files.user_id = users.id
+        ORDER BY files.id DESC
+    """).fetchall()
+
+    conn.close()
+
+    rows = ""
+    for f in file_list:
+        rows += f"""
+        <tr>
+            <td>{f['filename']}</td>
+            <td>{f['name']}</td>
+            <td>{f['uploaded_at']}</td>
+            <td><a href="/download/{f['id']}">Download</a></td>
+        </tr>
+        """
+
+    body = f"""
+    <h2>Shared Files</h2>
+
+    <form method="POST" enctype="multipart/form-data">
+        <input type="file" name="file" required>
+        <button type="submit">Upload File</button>
+    </form>
+
+    <table>
+        <tr>
+            <th>File Name</th>
+            <th>Uploaded By</th>
+            <th>Time</th>
+            <th>Download</th>
+        </tr>
+        {rows}
+    </table>
+    """
+
+    return page("Files", body)
+
+
+@app.route("/download/<int:file_id>")
+@login_required
+def download(file_id):
+    conn = db()
+    f = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+    conn.close()
+
+    if not f:
+        return "File not found"
+
+    return send_from_directory(
+        UPLOAD_FOLDER,
+        f["stored_name"],
+        as_attachment=True,
+        download_name=f["filename"]
+    )
+
+
+# ---------------- ADMIN PANEL ----------------
+
+@app.route("/admin")
+@admin_required
+def admin():
+    conn = db()
+
+    users = conn.execute("SELECT * FROM users ORDER BY role, name").fetchall()
+
+    rows = ""
+    for u in users:
+        seconds = total_work_seconds(u["id"])
+
+        task_count = conn.execute(
+            "SELECT COUNT(*) AS total FROM tasks WHERE user_id=?",
+            (u["id"],)
+        ).fetchone()["total"]
+
+        completed = conn.execute(
+            "SELECT COUNT(*) AS total FROM tasks WHERE user_id=? AND status='Completed'",
+            (u["id"],)
+        ).fetchone()["total"]
+
+        rows += f"""
+        <tr>
+            <td>{u['name']}</td>
+            <td>{u['phone']}</td>
+            <td>{u['university']}</td>
+            <td>{u['role']}</td>
+            <td>{format_seconds(seconds)}</td>
+            <td>{task_count}</td>
+            <td>{completed}</td>
+        </tr>
+        """
+
+    conn.close()
+
+    body = f"""
+    <h2>Admin Panel</h2>
+    <p>Admin can monitor users, work time, task count, and completed tasks.</p>
+
+    <table>
+        <tr>
+            <th>Name</th>
+            <th>Phone</th>
+            <th>University</th>
+            <th>Role</th>
+            <th>Total Work</th>
+            <th>Total Tasks</th>
+            <th>Completed Tasks</th>
+        </tr>
+        {rows}
+    </table>
+    """
+
+    return page("Admin Panel", body)
+
+
+# ---------------- RUN APP ----------------
+
+if __name__ == "__main__":
+    app.run(debug=True)
